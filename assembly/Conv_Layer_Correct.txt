@@ -1,0 +1,242 @@
+#define STDOUT 0xd0580000
+
+.section .text
+.global _start
+
+_start:
+    # Load parameters
+    la a0, input_tensor   # Input tensor (28x28 float array)
+    la a1, conv_filters   # Filter weights (8 filters of 5x5 each)
+    la a2, conv_biases    # Bias terms (8 floats)
+    la a3, output_tensor  # Output buffer (8x24x24 float array)
+    
+    # Call convolution layer
+    call Conv_layer
+    
+    # Print first output values from the first feature map
+    la a0, output_tensor
+    li a1, 8            # Print first 4 values
+    call printToLogVectorized
+    
+    # Terminate
+    j _finish
+
+# ------------------------------------------
+# Full Convolutional Layer Implementation
+# Implements the following specification:
+# - Input: 28x28 matrix
+# - Filters: 8 filters of size 5x5
+# - Stride: 1
+# - Padding: 0 (valid convolution)
+# - Output: 8 feature maps of size 24x24
+# ------------------------------------------
+Conv_layer:
+    # Save callee-saved registers
+    addi sp, sp, -64
+    sw ra, 0(sp)
+    sw s0, 4(sp)
+    sw s1, 8(sp)
+    sw s2, 12(sp)
+    sw s3, 16(sp)
+    sw s4, 20(sp)
+    sw s5, 24(sp)
+    sw s6, 28(sp)
+    sw s7, 32(sp)
+    sw s8, 36(sp)
+    sw s9, 40(sp)
+    sw s10, 44(sp)
+    sw s11, 48(sp)
+    
+    # Constants
+    li s0, 28      # Input width/height
+    li s1, 24      # Output width/height (28-5+1)
+    li s2, 5       # Filter size
+    li s3, 8       # Number of filters
+    
+    # Loop over filters (k=0 to 7)
+    li s4, 0       # s4 = filter index (k)
+filter_loop:
+    # Load bias for current filter
+    slli t0, s4, 2         # t0 = k * 4 bytes
+    add t0, a2, t0         # t0 = &biases[k]
+    flw ft0, 0(t0)         # ft0 = biases[k]
+    
+    # Loop over output rows (i=0 to 23)
+    li s5, 0               # s5 = row index (i)
+row_loop:
+    # Set vector length based on architecture capabilities
+    li t0, 8               # Try to process 8 columns at once
+    vsetvli t1, t0, e32, m2  # Use vector registers v0-v3
+    
+    # Loop over output columns in blocks (j=0 to 23)
+    li s6, 0               # s6 = column index (j)
+col_loop:
+    # Check if we need to adjust vector length for remaining columns
+    sub t0, s1, s6         # t0 = remaining columns
+    vsetvli t1, t0, e32, m2  # Adjust vector length
+    
+    # Initialize accumulator with bias
+    vfmv.v.f v0, ft0         # v0 = vector filled with bias value
+    
+    # Loop over filter rows (m=0 to 4)
+    li s7, 0               # s7 = filter row (m)
+filter_row_loop:
+    # Loop over filter columns (n=0 to 4)
+    li s8, 0               # s8 = filter column (n)
+filter_col_loop:
+    # Calculate filter value address: filters + (k*25 + m*5 + n)*4
+    li t0, 25              # t0 = 5*5 (filter size)
+    mul t0, s4, t0         # t0 = k * 25
+    li t2, 5               # t2 = filter width
+    mul t3, s7, t2         # t3 = m * 5
+    add t0, t0, t3         # t0 = k*25 + m*5
+    add t0, t0, s8         # t0 = k*25 + m*5 + n
+    slli t0, t0, 2         # t0 *= 4 (byte offset)
+    add t0, a1, t0         # t0 = &filters[k][m][n]
+    flw ft1, 0(t0)         # ft1 = filters[k][m][n]
+    
+    # Calculate input base address: input + ((i+m)*28 + (j+n))*4
+    add t0, s5, s7         # t0 = i + m
+    mul t0, t0, s0         # t0 = (i+m) * 28
+    add t0, t0, s6         # t0 = (i+m)*28 + j
+    add t0, t0, s8         # t0 = (i+m)*28 + j + n
+    slli t0, t0, 2         # t0 *= 4 (byte offset)
+    add t0, a0, t0         # t0 = &input[i+m][j+n]
+    
+    # Load vector of input values and perform FMA
+    vle32.v v2, (t0)         # v2 = input values
+    vfmv.v.f v4, ft1         # v4 = vector of filter value
+    vfmacc.vv v0, v2, v4     # v0 += v2 * v4
+    
+    # Next filter column
+    addi s8, s8, 1
+    blt s8, s2, filter_col_loop
+    
+    # Next filter row
+    addi s7, s7, 1
+    blt s7, s2, filter_row_loop
+    
+    # Calculate output address: output + (k*24*24 + i*24 + j)*4
+    mul t0, s4, s1         # t0 = k * 24
+    mul t0, t0, s1         # t0 = k * 24 * 24
+    mul t2, s5, s1         # t2 = i * 24
+    add t0, t0, t2         # t0 = k*24*24 + i*24
+    add t0, t0, s6         # t0 = k*24*24 + i*24 + j
+    slli t0, t0, 2         # t0 *= 4 (byte offset)
+    add t0, a3, t0         # t0 = &output[k][i][j]
+    
+    # Store result
+    vse32.v v0, (t0)         # Store vector result
+    
+    # Next column block
+    add s6, s6, t1           # j += vector_length
+    blt s6, s1, col_loop     # Continue if j < 24
+    
+    # Next row
+    addi s5, s5, 1
+    blt s5, s1, row_loop     # Continue if i < 24
+    
+    # Next filter
+    addi s4, s4, 1
+    blt s4, s3, filter_loop  # Continue if k < 8
+    
+    # Restore saved registers
+    lw ra, 0(sp)
+    lw s0, 4(sp)
+    lw s1, 8(sp)
+    lw s2, 12(sp)
+    lw s3, 16(sp)
+    lw s4, 20(sp)
+    lw s5, 24(sp)
+    lw s6, 28(sp)
+    lw s7, 32(sp)
+    lw s8, 36(sp)
+    lw s9, 40(sp)
+    lw s10, 44(sp)
+    lw s11, 48(sp)
+    addi sp, sp, 64
+    
+    ret
+
+# ------------------------------------------
+# Verified Print Function
+# ------------------------------------------
+printToLogVectorized:
+    addi sp, sp, -4
+    sw a0, 0(sp)
+
+    li t0, 0x123
+    li t0, 0x456
+    mv a1, a1
+    li t0, 0
+
+printloop:
+    vsetvli t3, a1, e32
+    slli t4, t3, 2
+
+    vle32.v v1, (a0)
+    add a0, a0, t4
+    add t0, t0, t3
+
+    bge t0, a1, endPrintLoop
+    j printloop
+
+endPrintLoop:
+    li t0, 0x123
+    li t0, 0x456
+
+    lw a0, 0(sp)
+    addi sp, sp, 4
+    jr ra
+
+# ------------------------------------------
+# Termination Sequence
+# ------------------------------------------
+_finish:
+    li x3, 0xd0580000    # Veer termination address
+    addi x5, x0, 0xff
+    sb x5, 0(x3)
+    beq x0, x0, _finish  # Infinite loop
+
+    .rept 100
+        nop
+    .endr
+
+.section .data
+# Input tensor (28x28 float array)
+input_tensor:
+    # Include sample input data (28x28 matrix)
+    # Can use your existing matrix data or placeholder values
+    .float 333.75, 588.0, -957.75, -914.75, -150.0, -966.75, 744.25, 876.0, 83.25, -302.25, -49.0, 588.0, -6.25, 36.25, 118.5, 367.25, 343.25, 439.75, 20.5, 8.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    .float 700.75, 141.5, -464.25, 698.25, 370.75, 835.75, 492.25, 424.75, 958.75, -293.25, 92.75, 716.5, -478.25, 791.5, -142.25, 761.0, 235.5, -650.0, 345.5, 946.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    # Add all rows up to 28 here
+    # For brevity, filling the rest with zeros:
+    .zero (28*28-2*28)*4  # Fill remaining input tensor with zeros
+
+# Filter weights (8 filters of 5x5 each = 200 floats)
+conv_filters:
+    # First filter (5x5)
+    .float 0.35365000, -0.25632870, -0.44216833, 0.15843540, 0.09459874
+    .float -0.54049528, -0.53184646, 0.03936517, 0.22009230, 0.37529960
+    .float -0.35489005, 0.16881239, 0.40112746, 0.17117818, 0.06382002
+    .float 0.15382232, 0.29604542, 0.19350106, 0.09646993, -0.35931459
+    .float 0.21975663, 0.19576961, -0.10448381, -0.33259654, -0.34001398
+
+    # Second filter (5x5)
+    .float 0.08571938, 0.05246818, -0.13640058, -0.30890834, -0.36421886
+    .float 0.06875563, 0.19719137, 0.11737578, 0.13695860, -0.21291991
+    .float 0.21034351, 0.21524154, 0.37388074, 0.27672431, 0.17929377
+    .float -0.18414134, -0.05535920, 0.13654919, 0.15569174, 0.04428325
+    .float -0.26554105, -0.37985030, -0.30674666, -0.06591699, 0.15563157
+
+    # Include all 8 filters here
+    # For brevity, filling the rest with zeros:
+    .zero (8*5*5-2*5*5)*4  # Fill remaining filters with zeros
+
+# Bias terms (8 floats)
+conv_biases:
+    .float 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+# Output tensor (8x24x24 float array)
+output_tensor:
+    .space 8*24*24*4  # 8 channels, 24x24 feature maps, 4 bytes per float
