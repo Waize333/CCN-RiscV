@@ -403,9 +403,8 @@ dense_dot_product_loop:
     addi sp, sp, 36
     ret
 
-# ==================================
-# Improved Softmax Implementation
-# ==================================
+# Function: softmax 
+# ------------------------------------------
 softmax:
     addi sp, sp, -24
     sw ra, 20(sp)
@@ -414,99 +413,82 @@ softmax:
     sw s2, 8(sp)
     sw s3, 4(sp)
     sw s4, 0(sp)
-
+    
     mv s0, a0       # s0 = input array pointer
     mv s1, a1       # s1 = output array pointer
-    mv s2, a2       # s2 = total elements (10)
-
-    # -----------------------------------------------------------------
-    # Step 1: Find maximum value for numerical stability
-    # -----------------------------------------------------------------
-    # Initialize max to first element
-    flw ft0, 0(s0)      # ft0 = max value
-    li t0, 1            # t0 = element counter
-    mv t1, s0           # t1 = pointer
+    mv s2, a2       # s2 = total number of elements
     
-find_max_loop:
-    bge t0, s2, find_max_done
-    addi t1, t1, 4      # move to next element
-    flw ft1, 0(t1)      # load next value
-    flt.s t2, ft0, ft1  # compare with max
-    beqz t2, not_new_max
-    fmv.s ft0, ft1      # update max
-not_new_max:
-    addi t0, t0, 1
-    j find_max_loop
+    #calculate e^x approximation for each element
+    mv s3, s0       # Current input pointer
+    mv s4, s1       # Current output pointer
+    mv t0, s2       # Remaining elements to process
     
-find_max_done:
-    # ft0 now contains max value
-
-    # -----------------------------------------------------------------
-    # Step 2: Compute exponentials (with max subtraction)
-    # -----------------------------------------------------------------
-    mv t0, s0           # input pointer
-    mv t1, s1           # output pointer
-    li t2, 0            # element counter
-    fmv.w.x fa0, zero   # sum accumulator
+    #constants
+    la t4, half
+    flw fa0, 0(t4)  # fa0 = 0.5
+    la t5, sixth
+    flw fa1, 0(t5)  # fa1 = 1/6
+    la t6, one
+    flw fa2, 0(t6)  # fa2 = 1.0
     
-exp_loop:
-    bge t2, s2, exp_done
-    flw ft1, 0(t0)      # load input value
-    fsub.s ft1, ft1, ft0 # subtract max (x -= max)
+    #sum accumulator
+    fmv.w.x fa3, zero
     
-    # Fast exp approximation: 1 + x + x²/2 + x³/6
-    fmul.s ft2, ft1, ft1 # x²
-    fmul.s ft3, ft2, ft1 # x³
+    exp_loop:
+    vsetvli t1, t0, e32, ta, ma  # Set vector length for this iteration
+    vle32.v v1, (s3)             # v1 = current chunk of input vector
     
-    # Load constants
-    li t3, 0x3f000000   # 0.5
-    fmv.w.x ft4, t3
-    li t3, 0x3e2aaaab   # 1/6
-    fmv.w.x ft5, t3
+    vfmul.vv v2, v1, v1          # v2 = x²
     
-    fmul.s ft2, ft2, ft4 # x²/2
-    fmul.s ft3, ft3, ft5 # x³/6
+    vfmul.vv v3, v2, v1          # v3 = x³
     
-    # Sum terms
-    li t3, 0x3f800000   # 1.0
-    fmv.w.x ft6, t3
-    fadd.s ft7, ft6, ft1 # 1 + x
-    fadd.s ft7, ft7, ft2 # + x²/2
-    fadd.s ft7, ft7, ft3 # + x³/6
+    vfmv.v.f v4, fa0
+    vfmul.vv v4, v4, v2          # v4 = x² * 0.5
     
-    # Store result and accumulate sum
-    fsw ft7, 0(t1)
-    fadd.s fa0, fa0, ft7
+    vfmv.v.f v5, fa1
+    vfmul.vv v5, v5, v3          # v5 = x³ * 1/6
     
-    addi t0, t0, 4
-    addi t1, t1, 4
-    addi t2, t2, 1
-    j exp_loop
+    vfadd.vv v6, v1, v4          # v6 = x + x²/2
+    vfadd.vv v6, v6, v5          # v6 = x + x²/2 + x³/6
+    vfmv.v.f v7, fa2
+    vfadd.vv v7, v7, v6          # v7 = 1 + x + x²/2 + x³/6 ≈ e^x Taylor Series
     
-exp_done:
-    # fa0 now contains sum of exponentials
-
-    # -----------------------------------------------------------------
-    # Step 3: Normalize by sum
-    # -----------------------------------------------------------------
-    mv t0, s1           # output pointer (start)
-    mv t1, s1           # output pointer (current)
-    li t2, 0            # element counter
+    # Store e^x approximations temporarily to output array
+    vse32.v v7, (s4)
     
-normalize_loop:
-    bge t2, s2, normalize_done
-    flw ft0, 0(t1)      # load exp(value)
-    fdiv.s ft0, ft0, fa0 # divide by sum
-    fsw ft0, 0(t1)      # store normalized value
+    # Accumulate the sum of all e^x values
+    vmv.v.i v8, 0
+    vfredusum.vs v8, v7, v8      # Sum all elements in v7
+    vfmv.f.s ft0, v8             # Extract scalar result
+    fadd.s fa3, fa3, ft0         # Add to running total
     
-    addi t1, t1, 4
-    addi t2, t2, 1
-    j normalize_loop
+    slli t2, t1, 2               # t2 = bytes processed (4 bytes per float)
+    add s3, s3, t2               # Update input pointer
+    add s4, s4, t2               # Update output pointer
+    sub t0, t0, t1               # Decrease remaining elements
+    bnez t0, exp_loop            # Continue if elements remain
     
-normalize_done:
-    # -----------------------------------------------------------------
-    # Cleanup and return
-    # -----------------------------------------------------------------
+    #Normalize by dividing each e^x by the sum
+    mv s3, s1                    # Reset to beginning of output array
+    mv s4, s1                    # We'll overwrite the same array
+    mv t0, s2                    # Reset element counter
+    
+    normalize_loop:
+    vsetvli t1, t0, e32, ta, ma  # Set vector length for this iteration
+    vle32.v v1, (s3)             # Load e^x values
+    
+    vfmv.v.f v2, fa3             # Broadcast sum to v2
+    vfdiv.vv v3, v1, v2          # v3 = e^x / sum
+    
+    vse32.v v3, (s4)
+    
+    slli t2, t1, 2               # t2 = bytes processed
+    add s3, s3, t2               # Update input pointer
+    add s4, s4, t2               # Update output pointer
+    sub t0, t0, t1               # Decrease remaining elements
+    bnez t0, normalize_loop      # Continue if elements remain
+    
+    # Restore saved registers and return
     lw ra, 20(sp)
     lw s0, 16(sp)
     lw s1, 12(sp)
@@ -514,7 +496,7 @@ normalize_done:
     lw s3, 4(sp)
     lw s4, 0(sp)
     addi sp, sp, 24
-    ret
+    ret # return
 # ------------------------------------------
 # Verified Print Function
 # ------------------------------------------
